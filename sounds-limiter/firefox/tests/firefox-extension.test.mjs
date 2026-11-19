@@ -3,26 +3,23 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 
-const script = await readFile(new URL("../volume-limiter.js", import.meta.url), "utf8");
-const LIMIT = 0.01;
+const contentScript = await readFile(new URL("../volume-limiter.js", import.meta.url), "utf8");
+const mainWorldScript = await readFile(new URL("../volume-limiter-main.js", import.meta.url), "utf8");
+const matchingPrefix = "https://media.example.test/audio";
 
-const createHarness = async (initialMedia = []) => {
-  class Element {
-    constructor(children = []) {
-      this.children = children;
-    }
-
-    querySelectorAll() {
-      return this.children;
-    }
-  }
+const createLimiter = async ({
+  urlPrefixes = [matchingPrefix],
+  maxVolumePercent = 50,
+  pageUrl = "https://page.example.test/"
+} = {}) => {
+  class Element {}
 
   class HTMLMediaElement extends Element {
-    constructor({ src = "", volume = 1 } = {}) {
+    constructor(src, initialVolume = 1) {
       super();
       this.src = src;
       this.currentSrc = src;
-      this._volume = volume;
+      this._volume = initialVolume;
     }
 
     querySelector() {
@@ -41,95 +38,150 @@ const createHarness = async (initialMedia = []) => {
     }
   });
 
-  const mediaElements = initialMedia.map((options) =>
-    options === undefined ? undefined : new HTMLMediaElement(options)
-  );
-  const documentRoot = new Element(mediaElements);
-  const eventListeners = new Map();
+  const nativeVolume = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "volume");
+  const media = [];
+  const listeners = new Map();
+  const windowListeners = new Map();
+  const storageListeners = [];
+  const volumeLogs = [];
+  let currentMaxVolumePercent = maxVolumePercent;
   const document = {
-    documentElement: documentRoot,
-    querySelectorAll: () => mediaElements,
+    documentElement: {},
+    querySelectorAll() {
+      return media;
+    },
     addEventListener(type, listener) {
-      eventListeners.set(type, listener);
+      listeners.set(type, listener);
     }
   };
-  const observers = [];
 
   class MutationObserver {
-    constructor(callback) {
-      this.callback = callback;
-      observers.push(this);
-    }
-
     observe() {}
   }
 
-  const nativeVolume = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "volume");
-  const context = vm.createContext({ Element, HTMLMediaElement, MutationObserver, document });
-  vm.runInContext(script, context);
+  const browser = {
+    storage: {
+      local: {
+        async get() {
+          return { urlPrefixes, maxVolumePercent: currentMaxVolumePercent };
+        }
+      },
+      onChanged: {
+        addListener(listener) {
+          storageListeners.push(listener);
+        }
+      }
+    }
+  };
+
+  const window = {
+    addEventListener(type, listener) {
+      const listenersForType = windowListeners.get(type) || [];
+      listenersForType.push(listener);
+      windowListeners.set(type, listenersForType);
+    },
+    postMessage(data) {
+      for (const listener of windowListeners.get("message") || []) {
+        listener({ source: window, origin: new URL(pageUrl).origin, data });
+      }
+    }
+  };
+
+  const context = vm.createContext({
+    Element,
+    HTMLMediaElement,
+    MutationObserver,
+    browser,
+    document,
+    window,
+    console: { info(message) { volumeLogs.push(message); } },
+    setInterval() { return 1; },
+    clearInterval() {},
+    location: new URL(pageUrl)
+  });
+  vm.runInContext(mainWorldScript, context);
+  vm.runInContext(contentScript, context);
+  await new Promise((resolve) => setImmediate(resolve));
 
   return {
-    mediaElements,
-    addMedia(options) {
-      const media = new HTMLMediaElement(options);
-      mediaElements.push(media);
-      documentRoot.children = mediaElements;
-      return media;
+    addMedia(src, initialVolume = 1) {
+      const element = new HTMLMediaElement(src, initialVolume);
+      media.push(element);
+      return element;
     },
-    notifyAdded(node) {
-      const observer = observers.find((candidate) => candidate.callback);
-      observer.callback([{ type: "childList", addedNodes: [node] }]);
+    async changeMaxVolume(percent) {
+      currentMaxVolumePercent = percent;
+      for (const listener of storageListeners) {
+        listener({ maxVolumePercent: { newValue: percent } }, "local");
+      }
+      await new Promise((resolve) => setImmediate(resolve));
     },
-    setVolumeThroughPlayerControl(media, value) {
-      nativeVolume.set.call(media, value);
-      eventListeners.get("volumechange")({ target: media });
-    }
+    simulateExternalVolumeChange(element, volume) {
+      nativeVolume.set.call(element, volume);
+      listeners.get("volumechange")({ target: element });
+    },
+    volumeLogs
   };
 };
 
-test("limits sourced media found during initial page scan", async () => {
-  const harness = await createHarness([{ src: "https://media.example.test/audio.mp3", volume: 0.8 }]);
-  const [media] = harness.mediaElements;
+test("caps matching media at the configured maximum", async () => {
+  const limiter = await createLimiter({ maxVolumePercent: 50 });
+  const matchingMedia = limiter.addMedia(`${matchingPrefix}/track.mp3`);
 
-  assert.equal(media.volume, LIMIT);
+  matchingMedia.volume = 0.9;
+  limiter.simulateExternalVolumeChange(matchingMedia, matchingMedia.volume);
+
+  assert.equal(matchingMedia.volume, 0.5);
+  assert.deepEqual(limiter.volumeLogs, ["[URL Volume Limiter] Volume changed: 50%"]);
 });
 
-test("caps later attempts to raise sourced media volume", async () => {
-  const harness = await createHarness();
-  const media = harness.addMedia({ src: "https://media.example.test/audio.mp3", volume: 0.2 });
+test("does not cap media outside the configured URL prefixes", async () => {
+  const limiter = await createLimiter({ maxVolumePercent: 50 });
+  const otherMedia = limiter.addMedia("https://other.example.test/track.mp3");
 
-  media.volume = 0.8;
+  otherMedia.volume = 0.9;
+  limiter.simulateExternalVolumeChange(otherMedia, otherMedia.volume);
 
-  assert.equal(media.volume, LIMIT);
+  assert.equal(otherMedia.volume, 0.9);
+  assert.deepEqual(limiter.volumeLogs, []);
 });
 
-test("caps volume changes made through the browser media controls", async () => {
-  const harness = await createHarness();
-  const media = harness.addMedia({ src: "https://glzwizzlv.bynetcdn.com/glglz_mp3", volume: 0.2 });
+test("caps blob-backed media when its YouTube watch page matches a wildcard prefix", async () => {
+  const limiter = await createLimiter({
+    urlPrefixes: ["https://www.youtube.com/watch*"],
+    pageUrl: "https://www.youtube.com/watch?v=example",
+    maxVolumePercent: 25
+  });
+  const youtubeMedia = limiter.addMedia("blob:https://www.youtube.com/8e113e3a", 0.9);
 
-  harness.setVolumeThroughPlayerControl(media, 0.8);
+  youtubeMedia.volume = 0.8;
 
-  assert.equal(media.volume, LIMIT);
+  assert.equal(youtubeMedia.volume, 0.25);
 });
 
-test("does not cap media without a source", async () => {
-  const harness = await createHarness();
-  const media = harness.addMedia({ volume: 0.8 });
+test("caps and logs the KAN Gimmel stream URL", async () => {
+  const streamUrl = "https://27613.live.streamtheworld.com/KAN_GIMMEL.mp3";
+  const limiter = await createLimiter({
+    urlPrefixes: [streamUrl],
+    pageUrl: streamUrl,
+    maxVolumePercent: 35
+  });
+  const streamMedia = limiter.addMedia(streamUrl);
 
-  media.volume = 0.6;
+  streamMedia.volume = 0.9;
+  limiter.simulateExternalVolumeChange(streamMedia, streamMedia.volume);
 
-  assert.equal(media.volume, 0.6);
+  assert.equal(streamMedia.volume, 0.35);
+  assert.deepEqual(limiter.volumeLogs, ["[URL Volume Limiter] Volume changed: 35%"]);
 });
 
-test("limits sourced media added after the initial scan", async () => {
-  const harness = await createHarness();
-  const media = harness.addMedia({ src: "https://media.example.test/new.mp3", volume: 0.8 });
+test("applies a changed cap to existing media and later volume changes", async () => {
+  const limiter = await createLimiter({ maxVolumePercent: 50 });
+  const matchingMedia = limiter.addMedia(`${matchingPrefix}/track.mp3`, 0.8);
 
-  harness.notifyAdded(media);
+  await limiter.changeMaxVolume(30);
+  assert.equal(matchingMedia.volume, 0.3);
 
-  assert.equal(media.volume, LIMIT);
-});
-
-test("ignores an undefined media entry without throwing", async () => {
-  await assert.doesNotReject(() => createHarness([undefined]));
+  limiter.simulateExternalVolumeChange(matchingMedia, 0.9);
+  assert.equal(matchingMedia.volume, 0.3);
 });
