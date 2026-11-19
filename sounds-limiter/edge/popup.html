@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>URL Volume Limiter</title>
+    <link rel="stylesheet" href="popup.css">
+    <script src="popup.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <h1>URL Volume Limiter</h1>
+      <p class="intro">Choose the maximum volume for matching audio and video.</p>
+      <section class="volume-setting" aria-labelledby="volume-label">
+        <div class="volume-heading">
+          <label id="volume-label" for="max-volume">Maximum volume</label>
+          <output id="max-volume-value" for="max-volume" aria-live="polite">2%</output>
+        </div>
+        <input id="max-volume" name="max-volume" type="range" min="1" max="100" step="1" value="2">
+        <p class="help">Attempts to raise matching media above this level will be capped.</p>
+      </section>
+      <form id="add-form">
+        <label for="url-prefix">URL prefix</label>
+        <div class="add-row">
+          <input id="url-prefix" name="url-prefix" type="url" placeholder="https://example.com/audio" autocomplete="url" required>
+          <button type="submit">Add</button>
+        </div>
+        <p class="help">Your browser will ask for access to the site you add.</p>
+      </form>
+      <h2>Limited URLs</h2>
+      <ul id="url-list" aria-live="polite"></ul>
+      <p id="status" role="status" aria-live="polite"></p>
+    </main>
+  </body>
+</html>

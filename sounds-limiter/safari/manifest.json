@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "URL Volume Limiter",
+  "version": "1.0.3",
+  "description": "Caps audio and video volume at 1% on matching pages.",
+  "icons": {
+    "128": "icons/icon-128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://glzwizzlv.bynetcdn.com/glglz_mp3*",
+        "https://youtube.com/watch*",
+        "https://www.youtube.com/watch*"
+      ],
+      "js": ["volume-limiter.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["volume-limiter-main.js"],
+      "matches": [
+        "https://glzwizzlv.bynetcdn.com/glglz_mp3*",
+        "https://youtube.com/watch*",
+        "https://www.youtube.com/watch*"
+      ]
+    }
+  ]
+}
