@@ -1,70 +1,107 @@
 (() => {
   "use strict";
 
-  const URL_PREFIXES = ["https://glzwizzlv.bynetcdn.com/glglz_mp3", "https://www.youtube.com/watch*"];
-  const LIMIT = 0.01;
+  if (globalThis.__urlVolumeLimiterMainInitialized) return;
+  globalThis.__urlVolumeLimiterMainInitialized = true;
+
+  let urlPrefixes = [];
+  let maxVolumePercent = 2;
+  let configReceived = false;
+  const lastLoggedVolume = new WeakMap();
   const mediaPrototype = HTMLMediaElement.prototype;
   const volumeDescriptor = Object.getOwnPropertyDescriptor(mediaPrototype, "volume");
-
   if (!volumeDescriptor?.get || !volumeDescriptor?.set) return;
 
-  const isLimitedMedia = (media) => {
-    if (media == null) return false;
+  const matchesPrefix = (url) => urlPrefixes.some((prefix) => {
+    const wildcardIndex = prefix.indexOf("*");
+    return url.startsWith(wildcardIndex === -1 ? prefix : prefix.slice(0, wildcardIndex));
+  });
+
+  const isLimited = (media) => {
     const source = media.currentSrc || media.src || media.querySelector("source[src]")?.src;
-    return Boolean(source); // && URL_PREFIXES.some((prefix) => source.startsWith(prefix)));
+    return Boolean((source && matchesPrefix(source)) || matchesPrefix(location.href));
   };
 
-  const enforceLimit = (media) => {
-    if (isLimitedMedia(media) && volumeDescriptor.get.call(media) > LIMIT) {
-      volumeDescriptor.set.call(media, LIMIT);
+  const enforce = (media) => {
+    if (isLimited(media) && volumeDescriptor.get.call(media) > maxVolumePercent / 100) {
+      volumeDescriptor.set.call(media, maxVolumePercent / 100);
     }
   };
 
   Object.defineProperty(mediaPrototype, "volume", {
     ...volumeDescriptor,
     set(value) {
-      volumeDescriptor.set.call(this, isLimitedMedia(this) ? Math.min(Number(value), LIMIT) : value);
+      const requested = Number(value);
+      volumeDescriptor.set.call(this, isLimited(this) ? Math.min(requested, maxVolumePercent / 100) : value);
     }
   });
 
-  // Native player controls may update volume without going through the JS setter.
-  document.addEventListener("volumechange", (event) => {
-    enforceLimit(event.target);
-  }, true);
-
   const scan = (root = document) => {
-    if (root instanceof HTMLMediaElement) enforceLimit(root);
-    root.querySelectorAll?.("audio, video").forEach(enforceLimit);
+    if (root instanceof HTMLMediaElement) enforce(root);
+    root.querySelectorAll?.("audio, video").forEach(enforce);
   };
 
-  const observe = (root) => {
-    const observer = new MutationObserver((records) => {
-      for (const record of records) {
-        if (record.type === "attributes") {
-          scan(record.target);
-        } else {
-          record.addedNodes.forEach((node) => {
-            if (node instanceof Element) scan(node);
-          });
-        }
-      }
-    });
-    observer.observe(root, {
+  window.addEventListener("message", (event) => {
+    if (event.origin !== location.origin || event.data?.type !== "url-volume-limiter-config") return;
+    const config = event.data.config;
+    if (!Array.isArray(config?.urlPrefixes)) return;
+    urlPrefixes = config.urlPrefixes.filter((prefix) => typeof prefix === "string");
+    const value = Number(config.maxVolumePercent);
+    maxVolumePercent = Number.isFinite(value) ? Math.min(100, Math.max(1, value)) : 2;
+    configReceived = true;
+    scan();
+  });
+
+  const requestConfig = () => {
+    if (!configReceived) window.postMessage({ type: "url-volume-limiter-request-config" }, location.origin);
+  };
+  let configRequestAttempts = 0;
+  requestConfig();
+  const configRequestTimer = setInterval(() => {
+    if (configReceived || configRequestAttempts >= 200) {
+      clearInterval(configRequestTimer);
+      return;
+    }
+    configRequestAttempts += 1;
+    requestConfig();
+  }, 50);
+
+  document.addEventListener("volumechange", (event) => {
+    if (!(event.target instanceof HTMLMediaElement)) return;
+    const media = event.target;
+    enforce(media);
+    if (!isLimited(media)) return;
+
+    const volume = volumeDescriptor.get.call(media);
+    if (lastLoggedVolume.get(media) === volume) return;
+    lastLoggedVolume.set(media, volume);
+    console.info(`[URL Volume Limiter] Volume changed: ${Math.round(volume * 100)}%`);
+  }, true);
+
+  const observer = new MutationObserver((records) => {
+    for (const record of records) {
+      if (record.type === "attributes") scan(record.target);
+      else record.addedNodes.forEach((node) => {
+        if (node instanceof Element) scan(node);
+      });
+    }
+  });
+
+  const observeDocument = () => {
+    if (!document.documentElement) return false;
+    scan();
+    observer.observe(document.documentElement, {
       subtree: true,
       childList: true,
       attributes: true,
       attributeFilter: ["src"]
     });
+    return true;
   };
 
-  scan();
-  if (document.documentElement) observe(document.documentElement);
-  else {
-    new MutationObserver(() => {
-      if (document.documentElement) {
-        scan();
-        observe(document.documentElement);
-      }
-    }).observe(document, { childList: true });
+  if (!observeDocument()) {
+    observer.observe(document, { childList: true });
+    observer.takeRecords();
+    document.addEventListener("DOMContentLoaded", observeDocument, { once: true });
   }
 })();
